@@ -156,14 +156,30 @@ async def gh_create_repo(repo: str):
 
 async def gh_put_bytes(repo: str, path: str, content: bytes, message: str):
     encoded = base64.b64encode(content).decode()
+    url = f"{GH_API}/repos/{GITHUB_USERNAME}/{repo}/contents/{path}"
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.put(
-            f"{GH_API}/repos/{GITHUB_USERNAME}/{repo}/contents/{path}",
+        # 1) Check if file already exists (to fetch its sha)
+        sha = None
+        get_r = await client.get(
+            url,
             headers=gh_headers(),
-            json={"message": message, "content": encoded, "branch": "main"}
+            params={"ref": "main"}
         )
-        if r.status_code not in (200, 201):
-            raise HTTPException(500, f"Put {path} failed: {r.text}")
+        if get_r.status_code == 200:
+            try:
+                sha = get_r.json().get("sha")
+            except Exception:
+                sha = None  # fallback safely
+
+        # 2) Create or update with/without sha
+        payload = {"message": message, "content": encoded, "branch": "main"}
+        if sha:
+            payload["sha"] = sha
+
+        put_r = await client.put(url, headers=gh_headers(), json=payload)
+        if put_r.status_code not in (200, 201):
+            raise HTTPException(500, f"Put {path} failed: {put_r.text}")
+
 
 async def gh_latest_sha(repo: str) -> str:
     async with httpx.AsyncClient(timeout=60) as client:
