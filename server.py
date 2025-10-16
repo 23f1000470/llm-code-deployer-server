@@ -131,17 +131,28 @@ def gh_headers() -> Dict[str, str]:
         "Authorization": f"token {GITHUB_TOKEN}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": GITHUB_USERNAME or "llm-deployer",  # <-- add
     }
 
 async def gh_create_repo(repo: str):
     async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(f"{GH_API}/user/repos", headers=gh_headers(), json={
-            "name": repo, "private": False, "auto_init": False,
-            "description": "Auto-generated for evaluation.",
-            "has_issues": True, "has_wiki": False, "has_projects": False
-        })
+        r = await client.post(
+            f"{GH_API}/user/repos",
+            headers=gh_headers(),
+            json={
+                "name": repo,
+                "private": False,
+                "auto_init": True,   # <-- was False
+                "description": "Auto-generated for evaluation.",
+                "has_issues": True,
+                "has_wiki": False,
+                "has_projects": False,
+                "default_branch": "main"
+            },
+        )
         if r.status_code not in (201, 422):  # 422: already exists
             raise HTTPException(500, f"Repo create failed: {r.text}")
+
 
 async def gh_put_bytes(repo: str, path: str, content: bytes, message: str):
     encoded = base64.b64encode(content).decode()
