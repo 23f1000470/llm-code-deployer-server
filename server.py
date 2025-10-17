@@ -1,5 +1,5 @@
 import os, re, json, base64, time, asyncio
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
@@ -54,7 +54,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-# Minimal single-job Pages workflow (no configure-pages step)
+# Minimal single-job Pages workflow
 PAGES_WORKFLOW = """name: GitHub Pages
 
 on:
@@ -122,9 +122,6 @@ def parse_attachments(attachments: List[Attachment]) -> Dict[str, bytes]:
     return out
 
 def decode_possible_data_uri_or_text(val: str) -> bytes:
-    """
-    The LLM may output base64 data URIs for binary assets. If so, decode; otherwise treat as utf-8 text.
-    """
     m = DATA_URI_RE.match(val.strip())
     if m:
         return base64.b64decode(m.group(2))
@@ -144,7 +141,6 @@ async def ensure_repo(owner: str, repo: str) -> Dict[str, Any]:
     return r.json()
 
 async def ensure_actions_write_permissions(owner: str, repo: str):
-    # Give GITHUB_TOKEN write perms so deploy-pages can publish
     url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/permissions/workflow"
     payload = {"default_workflow_permissions": "write", "can_approve_pull_request_reviews": False}
     r = await gh("PUT", url, json_body=payload)
@@ -152,14 +148,11 @@ async def ensure_actions_write_permissions(owner: str, repo: str):
         print("⚠️ Could not set workflow write perms:", r.status_code, r.text)
 
 async def ensure_pages_site(owner: str, repo: str):
-    # Create/enable Pages set to build from Actions
     get_url = f"{GITHUB_API}/repos/{owner}/{repo}/pages"
     r = await gh("GET", get_url)
     if r.status_code == 404:
-        # create
         r2 = await gh("POST", get_url, json_body={"build_type": "workflow"})
         if r2.status_code not in (201, 204):
-            # Some accounts/orgs require explicit PUT (update) or UI; log but continue
             print("⚠️ Pages create failed:", r2.status_code, r2.text)
     elif r.status_code == 200:
         data = r.json()
@@ -171,7 +164,6 @@ async def ensure_pages_site(owner: str, repo: str):
         print("⚠️ Pages GET unexpected:", r.status_code, r.text)
 
 async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: str) -> str:
-    # 1) base ref/commit
     r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/main")
     r.raise_for_status()
     base_commit = r.json()["object"]["sha"]
@@ -180,7 +172,6 @@ async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: 
     r.raise_for_status()
     base_tree = r.json()["tree"]["sha"]
 
-    # 2) create blobs
     entries = []
     for path, blob in files.items():
         rb = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs",
@@ -188,19 +179,16 @@ async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: 
         rb.raise_for_status()
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": rb.json()["sha"]})
 
-    # 3) create new tree
     rt = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/trees",
                   json_body={"base_tree": base_tree, "tree": entries})
     rt.raise_for_status()
     new_tree = rt.json()["sha"]
 
-    # 4) commit
     rc = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/commits",
                   json_body={"message": message, "tree": new_tree, "parents": [base_commit]})
     rc.raise_for_status()
     new_commit = rc.json()["sha"]
 
-    # 5) move ref
     rr = await gh("PATCH", f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/main",
                   json_body={"sha": new_commit, "force": True})
     rr.raise_for_status()
@@ -268,7 +256,7 @@ PLANNER_USER_TMPL = """Expand this brief into a build SPEC for a static GitHub P
 
 Include keys:
 - files: list of file paths to create (must include: index.html, script.js, styles.css, README.md; plus any assets like assets/sample.png or data.csv)
-- dom_ids: ids required by the brief/tests (e.g., ["total-sales","github-created-at","captcha-text"])
+- dom_ids: ids required by the brief/tests (e.g., ["total-sales","github-created-at","captcha-text","stats-products","stats-total","sales-pie","theme-toggle"])
 - data_inputs: list of inputs you need (attachments, ?url params, remote APIs). For remote HTTP from browser, use proxy `https://aipipe.org/proxy/<ENCODED_URL>` to avoid CORS.
 - algorithms: stepwise logic to compute outputs from inputs
 - assets_needed: filenames and brief content/format for defaults (e.g., data.csv rows, a sample captcha image, rates.json)
@@ -299,7 +287,7 @@ Rules:
    - If SPEC says an input may be missing, use provided default assets (e.g., ./assets/sample.png or ./data.csv).
    - Render outputs into the DOM IDs promised in SPEC (e.g., #total-sales).
    - Be idempotent: re-rendering should not duplicate table rows; totals stay accurate after any updates.
-4) styles.css: basic layout and spacing; no inline styles in HTML.
+4) styles.css: basic layout and spacing; demonstrate clamp() and calc().
 5) README.md: include Task, Brief, How to run locally, How it works (inputs, IDs), License.
 6) Keep code minimal but correct.
 
@@ -325,8 +313,8 @@ ATTACHMENTS:
 {attachment_names}
 """
 
-# ===== Fallback deterministic templates =====
-def sales_fallback_files() -> Dict[str, bytes]:
+# ===== Deterministic templates =====
+def sales_round1_files() -> Dict[str, bytes]:
     index_html = """<!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sales Summary</title>
@@ -356,7 +344,7 @@ def sales_fallback_files() -> Dict[str, bytes]:
   }
   if (Object.keys(by).length) document.querySelector('#product-sales').classList.remove('d-none');
 })();"""
-    styles_css = "body{line-height:1.6}"
+    styles_css = "h1{font-size:clamp(1.5rem,2.5vw,2.25rem)} body{line-height:1.6}"
     data_csv = "product,sales\nA,10\nB,20.5\n"
     return {
         "index.html": index_html.encode(),
@@ -365,29 +353,147 @@ def sales_fallback_files() -> Dict[str, bytes]:
         "data.csv": data_csv.encode(),
     }
 
-def generic_fallback_files(brief: str) -> Dict[str, bytes]:
-    return {
-        "index.html": f"<!doctype html><html><head><meta charset='utf-8'><title>Generated App</title><link rel='stylesheet' href='./styles.css'></head><body class='container'><h1>Generated App</h1><pre id='brief'></pre><script src='./script.js'></script></body></html>".encode(),
-        "script.js": f"document.querySelector('#brief').textContent = {json.dumps(brief)};".encode(),
-        "styles.css": b"body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:2rem;}",
+def sales_round2_files() -> Dict[str, bytes]:
+    index_html = """<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sales Summary</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body class="container py-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h1 class="m-0">Sales Summary</h1>
+    <button id="theme-toggle" class="btn btn-outline-secondary">Toggle Theme</button>
+  </div>
+
+  <table id="stats-table" class="table table-bordered w-auto mb-4">
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Total Products</td><td id="stats-products">0</td></tr>
+      <tr><td>Total Sales</td><td id="stats-total">0</td></tr>
+    </tbody>
+  </table>
+
+  <p>Overall Total: <strong id="total-sales">0</strong></p>
+
+  <div class="row">
+    <div class="col-12 col-lg-6">
+      <table id="product-sales" class="table table-striped">
+        <thead><tr><th>Product</th><th>Sales</th></tr></thead><tbody></tbody>
+      </table>
+    </div>
+    <div class="col-12 col-lg-6">
+      <canvas id="sales-pie" height="240"></canvas>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="./script.js"></script>
+</body></html>"""
+    script_js = r"""(() => {
+  const $ = (sel) => document.querySelector(sel);
+  const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${encodeURIComponent(u)}` : u;
+
+  let chart;
+
+  async function loadData() {
+    const url = new URLSearchParams(location.search).get('url') || 'data.csv';
+    const text = await fetch(proxied(url)).then(r=>r.text()).catch(()=> '');
+    const rows = text.trim() ? text.trim().split(/\n+/).slice(1).map(l=>l.split(',')) : [];
+    const by = {}, products = new Set();
+    let total = 0;
+    for (const [p, v] of rows) {
+      const n = parseFloat(v);
+      if (!isNaN(n)) { total += n; by[p] = (by[p]||0)+n; products.add(p); }
+    }
+    // Stats
+    $('#total-sales').textContent = total.toFixed(2);
+    $('#stats-total').textContent = total.toFixed(2);
+    $('#stats-products').textContent = String(products.size);
+
+    // Table
+    const tbody = $('#product-sales tbody');
+    tbody.innerHTML = '';
+    for (const [k, v] of Object.entries(by)) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${k}</td><td>${v.toFixed(2)}</td>`;
+      tbody.appendChild(tr);
     }
 
-def choose_template(brief: str) -> Dict[str, bytes]:
+    // Chart
+    const labels = Object.keys(by);
+    const data = Object.values(by);
+    const ctx = document.getElementById('sales-pie').getContext('2d');
+    const isDark = document.documentElement.dataset.theme === 'dark';
+    const border = isDark ? '#ddd' : '#333';
+
+    if (chart) chart.destroy();
+    chart = new Chart(ctx, {
+      type: 'pie',
+      data: { labels, datasets: [{ data }] },
+      options: {
+        plugins: { legend: { labels: { color: border } } }
+      }
+    });
+  }
+
+  function toggleTheme() {
+    const root = document.documentElement;
+    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+    root.dataset.theme = next;
+    // Re-draw chart to match colors
+    loadData();
+  }
+
+  $('#theme-toggle').addEventListener('click', toggleTheme);
+  // initial
+  loadData();
+})();"""
+    styles_css = r""":root{
+  --bg: #ffffff;
+  --fg: #111111;
+  --muted: #6c757d;
+  --space: clamp(0.5rem, 1.5vw, 1rem);
+}
+:root[data-theme="dark"]{
+  --bg: #0f1115;
+  --fg: #e7e7e7;
+  --muted: #9aa0a6;
+}
+html,body{background:var(--bg);color:var(--fg);}
+h1{font-size:clamp(1.6rem, 3vw, 2.4rem); margin-bottom: calc(var(--space) * 1.5);}
+.table{margin-bottom: calc(var(--space) * 2);}
+.btn{margin-left: var(--space);}
+"""
+    return {
+        "index.html": index_html.encode(),
+        "script.js": script_js.encode(),
+        "styles.css": styles_css.encode(),
+    }
+
+def generic_files(brief: str) -> Dict[str, bytes]:
+    return {
+        "index.html": f"<!doctype html><html><head><meta charset='utf-8'><title>Generated App</title><link rel='stylesheet' href='./styles.css'></head><body class='container py-4'><h1>Generated App</h1><pre id='brief'></pre><script src='./script.js'></script></body></html>".encode(),
+        "script.js": f"document.querySelector('#brief').textContent = {json.dumps(brief)};".encode(),
+        "styles.css": b"body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}",
+    }
+
+def choose_template(brief: str, round_i: int) -> Dict[str, bytes]:
     b = brief.lower()
     if "sum-of-sales" in b or ("sales" in b and "csv" in b):
-        return sales_fallback_files()
-    # other templates (markdown, captcha) can be added here similarly
-    return generic_fallback_files(brief)
+        return sales_round2_files() if round_i >= 2 else sales_round1_files()
+    return generic_files(brief)
 
 # ===== Validation =====
 def valid_files(files: Dict[str, bytes]) -> bool:
-    req = {"index.html", "script.js", "styles.css", "README.md"}
+    req = {"index.html", "script.js", "styles.css"}
+    # README.md will be added if missing
     return req.issubset(set(files.keys()))
 
 # ===== ROUTES =====
 @app.get("/")
 def root():
-    return {"status": "ok", "mode": "planner->builder with fallbacks"}
+    return {"status": "ok", "mode": "planner->builder with Round-2 deterministic fallback"}
 
 @app.post("/api-task")
 async def api_task(body: TaskPayload):
@@ -396,80 +502,70 @@ async def api_task(body: TaskPayload):
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
         raise HTTPException(status_code=500, detail="server missing GitHub config")
 
-    # --- parse attachments
+    # attachments
     att_bytes = parse_attachments(body.attachments)
     att_names = list(att_bytes.keys())
 
-    # --- try Option B (planner -> builder)
+    # try planner->builder, then single-shot
     files_text: Optional[Dict[str, str]] = None
     if LLM_URL and LLM_AUTH:
-        # Planner
-        planner_json = await llm_chat_json(
+        # planner
+        planner = await llm_chat_json(
             [{"role": "system", "content": PLANNER_SYSTEM},
              {"role": "user", "content": PLANNER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
         )
-        spec = None
-        if planner_json and isinstance(planner_json.get("spec"), dict):
-            spec = planner_json["spec"]
-            # Basic spec checks
-            has_list = isinstance(spec.get("files"), list) and any(isinstance(x, str) for x in spec["files"])
-            if not has_list:
-                spec = None
-
-        # Builder (only if spec OK)
-        if spec is not None:
-            builder_json = await llm_chat_json(
+        spec = planner.get("spec") if isinstance(planner, dict) else None
+        # builder
+        if isinstance(spec, dict):
+            built = await llm_chat_json(
                 [{"role": "system", "content": BUILDER_SYSTEM},
                  {"role": "user", "content": BUILDER_USER_TMPL.format(spec_json=json.dumps(spec))}]
             )
-            if builder_json and isinstance(builder_json.get("files"), dict):
-                files_text = {k: str(v) for k, v in builder_json["files"].items()}
-
-        # --- if Option B failed, try Option A
+            if isinstance(built, dict) and isinstance(built.get("files"), dict):
+                files_text = {k: str(v) for k, v in built["files"].items()}
+        # single-shot
         if files_text is None:
-            single_json = await llm_chat_json(
+            single = await llm_chat_json(
                 [{"role": "system", "content": SINGLE_BUILDER_SYSTEM},
                  {"role": "user", "content": SINGLE_BUILDER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
             )
-            if single_json and isinstance(single_json.get("files"), dict):
-                files_text = {k: str(v) for k, v in single_json["files"].items()}
+            if isinstance(single, dict) and isinstance(single.get("files"), dict):
+                files_text = {k: str(v) for k, v in single["files"].items()}
 
-    # --- convert files_text -> bytes
+    # convert to bytes
     files: Dict[str, bytes] = {}
     if files_text:
         for path, val in files_text.items():
             files[path] = decode_possible_data_uri_or_text(val)
 
-    # --- fallback deterministic templates if needed OR if required files missing
+    # fallback (now round-aware)
     if not files or not valid_files(files):
-        files = choose_template(body.brief)
+        files = choose_template(body.brief, body.round)
 
-    # --- merge/OVERWRITE attachments so tests read the correct content
+    # force-overwrite attachments
     for name, blob in att_bytes.items():
         files[name] = blob
 
-    # --- repo setup
     repo_name = body.task.replace("/", "-")
     pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
     await ensure_repo(GITHUB_USERNAME, repo_name)
     await ensure_actions_write_permissions(GITHUB_USERNAME, repo_name)
     await ensure_pages_site(GITHUB_USERNAME, repo_name)
 
-    # --- add license/readme/workflow to ONE batched commit
+    # add license/readme/workflow in one commit
     all_files: Dict[str, bytes] = {}
     all_files["LICENSE"] = MIT_LICENSE.format(year=time.strftime("%Y"), owner=GITHUB_USERNAME).encode()
-    readme = f"# {repo_name}\n\nTask: `{body.task}` (round {body.round})\n\nBrief:\n\n{body.brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
-    all_files["README.md"] = (files.get("README.md") or readme.encode())
+    # keep README from LLM if present, else synthesize
+    readme_auto = f"# {repo_name}\n\nTask: `{body.task}` (round {body.round})\n\nBrief:\n\n{body.brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
+    all_files["README.md"] = files.get("README.md", readme_auto.encode())
     all_files[".github/workflows/pages.yml"] = PAGES_WORKFLOW.encode()
-    # app files
     for p, b in files.items():
-        if p == "README.md":  # already handled
+        if p == "README.md":
             continue
         all_files[p] = b
 
     commit_sha = await batch_commit(GITHUB_USERNAME, repo_name, all_files, f"[{body.task}] round {body.round} deploy")
 
-    # --- best-effort wait for Pages
     await wait_for_200(pages_url, timeout_s=180)
 
     resp = {
