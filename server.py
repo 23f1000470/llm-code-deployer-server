@@ -78,7 +78,7 @@ jobs:
         uses: actions/deploy-pages@v4
 """
 
-DATA_URI_RE = re.compile(r"^data:([\\w/\\-+.]+);base64,(.*)$", re.IGNORECASE)
+DATA_URI_RE = re.compile(r"^data:([\w/.\+\-]+);base64,(.*)$", re.IGNORECASE)
 
 # ---- HTTP helpers ----
 async def gh(method: str, url: str, json_body=None, content=None, extra_headers=None):
