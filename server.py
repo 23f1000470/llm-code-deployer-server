@@ -62,6 +62,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true   # 👈 this creates/enables the Pages site if missing
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
