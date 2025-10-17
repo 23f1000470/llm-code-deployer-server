@@ -390,6 +390,7 @@ PATCHER_USER_TMPL = """You are given the current project files and a new BRIEF. 
 
 Hard requirements:
 - Do NOT echo the brief into the UI.
+- Always update README.md to include the current BRIEF.
 - Keep existing IDs/selectors and behaviors unless the BRIEF explicitly changes them.
 - Maintain accessibility and current structure; do not break existing features.
 - Only change what is necessary to complete the task.
