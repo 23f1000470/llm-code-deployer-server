@@ -49,7 +49,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: "pages"
   cancel-in-progress: true
 
 jobs:
@@ -57,10 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-        with:
-          enablement: true
-      - name: Upload artifact
+      # No configure-pages step needed since the server enabled Pages via PAT
+      - name: Upload static site
         uses: actions/upload-pages-artifact@v3
         with:
           path: ./
