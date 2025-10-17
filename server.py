@@ -269,18 +269,44 @@ async def llm_chat_json(messages: List[Dict[str, str]], model: str = "google/gem
         print("LLM error:", repr(e))
         return None
 
-# ===== Prompts =====
-PLANNER_SYSTEM = "Return STRICT JSON only, as {\"spec\":{...}}. No prose."
-PLANNER_USER_TMPL = """Expand this brief into a build SPEC for a static GitHub Pages app.
+# ===== Prompts (hardened) =====
+PLANNER_SYSTEM = (
+    "Return STRICT JSON only as {\"spec\":{...}}. No prose. "
+    "Plan for a static, browser-only GitHub Pages app that works without any server code."
+)
 
-Include keys:
-- files: list of file paths to create (must include: index.html, script.js, styles.css, README.md; plus any assets like assets/sample.png or data.csv)
-- dom_ids: ids required by the brief/tests
-- data_inputs: inputs (attachments, ?url params, remote APIs). For cross-origin fetches, use proxy: https://aipipe.org/proxy/<ENCODED_URL>
-- algorithms: stepwise logic
-- assets_needed: filenames + sample content for defaults
-- fallbacks: must render even if ?url or inputs missing
-- round2_extensions: likely additions (tables, filters, aria-live, charts, currency, caching)
+PLANNER_USER_TMPL = """Expand this brief into a precise build SPEC for a static GitHub Pages app.
+
+The SPEC MUST include:
+
+- files: list of file paths to create (MUST include: index.html, script.js, styles.css, README.md; plus any demo assets in /assets and a sample dataset like data.csv).
+- dom_ids: exact IDs your UI will use (e.g., #total-sales for an aggregate number, #data-table for the rendered table, #status for aria-live messages, #url-input, #file-input, #paste-input, #load-btn).
+- data_inputs: list and describe ALL inputs the app supports, in this priority order:
+  1) URL query ?url=<http/https/file name> (CSV/TSV/JSON). For cross-origin, always wrap with proxy: https://aipipe.org/proxy/<ENCODED_URL>
+  2) Local file via <input type="file"> (CSV/TSV/JSON) parsed client-side with FileReader.
+  3) Pasted raw text from a <textarea>.
+  Include guidance for Google Sheets (use `.../gviz/tq?tqx=out:csv`) and GitHub raw links.
+- algorithms: stepwise logic for:
+  - robust fetch with timeout + retry (AbortController), content-type and extension sniffing, BOM stripping, CR/LF normalization;
+  - CSV/TSV parsing that supports quoted fields, embedded commas, and variable header case; JSON path handling when specified in the brief;
+  - numeric parsing tolerant of currency symbols, thousands separators, and parentheses for negatives; treat blanks and non-numerics as 0 unless the brief forbids it;
+  - aggregate computations (e.g., sum of “sales” column) where the target column is chosen by case-insensitive header match and common synonyms (e.g., sales, amount, revenue, total).
+- renderers: how to render aggregates (to #total-sales) and full tabular data (to #data-table) without duplicate rows on re-render; include idempotent clear+render steps.
+- accessibility: include an aria-live region (#status) that announces loading / success / error; table with <thead>/<tbody>, scope=col, and proper labels.
+- UI layout: a small control panel with:
+  - text input (#url-input) + Load button (#load-btn),
+  - file input (#file-input accept .csv,.tsv,.json),
+  - textarea (#paste-input) with a “Load Pasted Data” button (#paste-btn),
+  - a “Reset to Sample” button (#reset-btn).
+- assets_needed: filenames + sample content for defaults (e.g., data.csv with realistic headers including the target column).
+- fallbacks: the app MUST render using local ./data.csv if:
+  - ?url is missing, invalid, 4xx/5xx, times out, or CORS-blocked,
+  - file parsing fails,
+  - paste is empty or invalid.
+  Errors must be visible in #status but never crash rendering.
+- caching: optional localStorage of last successful source (url|fileName|pasted) and rehydrate on load.
+- tests_hooks: deterministic IDs/behaviors the checkers can rely on (e.g., #total-sales textContent is a fixed decimal, #data-table has >= 1 row when sample loads).
+- round2_extensions: likely additions such as sorting headers, currency formatting toggle, dark mode, simple charts, filters, download-as-CSV, and performance notes.
 
 BRIEF:
 {brief}
@@ -289,31 +315,64 @@ ATTACHMENTS:
 {attachment_names}
 """
 
-BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
+BUILDER_SYSTEM = "Return STRICT JSON only as {\"files\":{...}}. No prose."
+
 BUILDER_USER_TMPL = """Using this SPEC, generate a browser-only static site for GitHub Pages.
 
-Rules:
-- Create at minimum: index.html, script.js, styles.css, README.md. Additional assets under /assets or root (e.g., data.csv).
-- index.html loads Bootstrap 5 (jsDelivr), links ./styles.css & ./script.js (relative), uses accessible markup.
-- script.js: parse URL params; wrap cross-origin fetches with proxy function:
-    const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
-  Use default local assets when inputs missing. Render to the exact IDs required by the SPEC. Avoid duplicate rows on re-render.
-- styles.css: basic layout; can use clamp() and calc().
-- README.md: Task, Brief, Usage, How it works (inputs & IDs), License.
-- Output full files (not diffs). No prose.
+Hard Rules:
+- MUST create: index.html, script.js, styles.css, README.md; plus any assets in /assets and a bundled sample dataset (e.g., data.csv).
+- index.html:
+  - loads Bootstrap 5 via jsDelivr,
+  - links ./styles.css and ./script.js (relative),
+  - includes accessible markup, a control panel, aria-live #status, #total-sales, #data-table, and controls (#url-input, #file-input, #paste-input, #load-btn, #paste-btn, #reset-btn) as described in the SPEC.
+- script.js:
+  - Parse URL params.
+  - Wrap cross-origin fetches with:
+      const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+  - Implement getTextFromUrl(url) with AbortController timeout (10s) + one retry; handle content-type text/plain, text/csv, application/octet-stream, application/json; strip BOM; normalize newlines.
+  - Implement getTextFromFile(file) using FileReader.
+  - Implement parseData(text, sourceHint) that:
+      * detects CSV/TSV by extension or delimiter sniff,
+      * supports quoted fields and embedded commas,
+      * is case-insensitive for headers,
+      * picks target numeric column by name according to the brief (e.g., "sales") with synonyms fallback,
+      * parses numbers by removing currency symbols, thousands separators, and parentheses for negatives.
+  - Implement render(data) that clears then repopulates #data-table (thead/tbody) and sets #total-sales to a fixed 2-decimal string; never duplicate rows on re-render.
+  - Implement status(message, level='info') that writes to #status (aria-live="polite") and also console.log.
+  - Load priority:
+      1) ?url param via proxied(),
+      2) file input,
+      3) pasted textarea,
+      4) fallback ./data.csv (always present).
+    On any failure, fall back automatically to the next source and show a visible message; ensure the page still renders with the sample dataset.
+  - Persist last successful source in localStorage and offer "Reset to Sample".
+- styles.css:
+  - sensible spacing, responsive container, readable table; dark-mode support via [data-theme].
+- README.md:
+  - Task, Brief, Usage (URL param, file input, paste), How it works (inputs, proxy, parsing), IDs used, Known limitations, License.
+- Output full file contents (not diffs). JSON only. No prose.
 
 SPEC:
 {spec_json}
 """
 
-SINGLE_BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
-SINGLE_BUILDER_USER_TMPL = """Build a browser-only static site for GitHub Pages that satisfies the brief.
+SINGLE_BUILDER_SYSTEM = "Return STRICT JSON only as {\"files\":{...}}. No prose."
+
+SINGLE_BUILDER_USER_TMPL = """Build a browser-only static site for GitHub Pages that satisfies the brief and is resilient to remote CSV issues.
 
 Requirements:
-- MUST return: index.html, script.js, styles.css, README.md; plus any needed assets.
-- index.html links ./styles.css and ./script.js; loads Bootstrap 5.
-- script.js handles ?url params; uses AIpipe CORS proxy for remote fetches; graceful fallbacks; render to exact IDs; no duplication.
-- Output full files (not diffs). No prose.
+- MUST return: index.html, script.js, styles.css, README.md; plus a bundled ./data.csv sample.
+- index.html links ./styles.css and ./script.js; loads Bootstrap 5; includes #status (aria-live), #total-sales, #data-table and the controls (#url-input, #file-input, #paste-input, #load-btn, #paste-btn, #reset-btn).
+- script.js:
+  - Handle ?url with the AIpipe CORS proxy helper:
+      const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+  - Provide robust fetch with timeout+retry, BOM strip, newline normalize.
+  - CSV/TSV parser supports quoted cells and auto delimiter; numeric parser tolerant of currency and thousands.
+  - Always fall back to ./data.csv and render even if remote fetch fails; show a clear status message.
+  - No duplicate rows on re-render; write final sum to #total-sales with 2 decimals; render full table to #data-table.
+- styles.css: basic layout + dark-mode.
+- README.md: explain inputs, proxy, and fallbacks.
+- Output full files (not diffs). JSON only. No prose.
 
 BRIEF:
 {brief}
@@ -326,6 +385,7 @@ PATCHER_SYSTEM = (
     "You are a precise code transformer. Return STRICT JSON only as {\"files\":{...}}. "
     "No prose. No explanations. No diffs. Output full updated files."
 )
+
 PATCHER_USER_TMPL = """You are given the current project files and a new BRIEF. Update the project with the **minimal** safe edits to satisfy the BRIEF while preserving working behavior.
 
 Hard requirements:
@@ -333,11 +393,18 @@ Hard requirements:
 - Keep existing IDs/selectors and behaviors unless the BRIEF explicitly changes them.
 - Maintain accessibility and current structure; do not break existing features.
 - Only change what is necessary to complete the task.
-- Avoid bugs/regressions; keep #ids like #total-sales accurate.
-- Return **full files** (not diffs), JSON only. Include at least: index.html, script.js, styles.css, README.md. You may add assets if needed.
-
-If fetching remote content from the browser, use this proxy helper:
-  const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+- Avoid bugs/regressions; keep #ids like #total-sales and #data-table accurate.
+- ALWAYS ensure robust data loading:
+  * Support ?url via the proxy helper:
+      const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+  * Keep a bundled ./data.csv fallback and render it when remote fetch fails.
+  * Provide (or keep) the local file input and paste flow.
+- Implement or preserve:
+  * timeout+retry on fetch, BOM stripping, CRLF normalization,
+  * CSV/TSV parsing with quoted fields and auto delimiter,
+  * numeric parsing tolerant of currency symbols, thousands, parentheses.
+- Do not duplicate rows on re-render; keep render idempotent.
+- Return **full files** (not diffs). Include at least: index.html, script.js, styles.css, README.md. You may add assets if needed (e.g., data.csv).
 
 BRIEF:
 {brief}
@@ -348,6 +415,7 @@ ATTACHMENTS:
 CURRENT_FILES (path => full text):
 {current_files_json}
 """
+
 
 # ===== Deterministic templates (safety net) =====
 def sales_round1_files() -> Dict[str, bytes]:
