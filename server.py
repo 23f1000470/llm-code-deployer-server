@@ -1,23 +1,23 @@
 import os, re, json, base64, time, asyncio
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 
 app = FastAPI()
 
-# ---- ENV ----
+# ===== ENV =====
 SECRET = os.getenv("SECRET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
-LLM_URL = (os.getenv("LLM_URL") or "").strip()
-LLM_AUTH = (os.getenv("LLM_AUTH") or "").strip()
+LLM_URL = (os.getenv("LLM_URL") or "").strip()           # e.g. https://aipipe.org/openrouter/v1
+LLM_AUTH = (os.getenv("LLM_AUTH") or "").strip()         # e.g. Bearer AIPIPE_TOKEN
 GITHUB_API = "https://api.github.com"
 
-# ---- MODELS ----
+# ===== MODELS =====
 class Attachment(BaseModel):
     name: str
-    url: str  # data URI
+    url: str  # base64 data URI
 
 class TaskPayload(BaseModel):
     email: str
@@ -30,23 +30,43 @@ class TaskPayload(BaseModel):
     evaluation_url: str
     attachments: List[Attachment] = []
 
-# ---- CONSTANTS ----
+# ===== CONSTANTS =====
 MIT_LICENSE = """MIT License
 
 Copyright (c) {year} {owner}
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction...
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND...
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 """
 
-# Minimal workflow: upload artifact -> deploy pages (no configure-pages step)
+# Minimal single-job Pages workflow (no configure-pages step)
 PAGES_WORKFLOW = """name: GitHub Pages
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - "index.html"
+      - "script.js"
+      - "styles.css"
+      - "assets/**"
+      - "data.*"
+      - ".github/workflows/pages.yml"
   workflow_dispatch:
 
 permissions:
@@ -55,7 +75,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: "pages"
   cancel-in-progress: true
 
 jobs:
@@ -78,20 +98,18 @@ jobs:
         uses: actions/deploy-pages@v4
 """
 
+# Safe regex for data URIs (dash escaped)
 DATA_URI_RE = re.compile(r"^data:([\w/.\+\-]+);base64,(.*)$", re.IGNORECASE)
 
-# ---- HTTP helpers ----
-async def gh(method: str, url: str, json_body=None, content=None, extra_headers=None):
-    headers = {
-        "Authorization": f"Bearer {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
+# ===== HTTP helper =====
+async def gh(method: str, url: str, json_body=None, content=None, extra_headers=None) -> httpx.Response:
+    headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     if extra_headers:
         headers.update(extra_headers)
     async with httpx.AsyncClient(timeout=60) as client:
         return await client.request(method, url, json=json_body, headers=headers, content=content)
 
-def b64encode_bytes(b: bytes) -> str:
+def b64e(b: bytes) -> str:
     return base64.b64encode(b).decode()
 
 def parse_attachments(attachments: List[Attachment]) -> Dict[str, bytes]:
@@ -103,85 +121,21 @@ def parse_attachments(attachments: List[Attachment]) -> Dict[str, bytes]:
         out[a.name] = base64.b64decode(m.group(2))
     return out
 
-# ---- LLM (optional) ----
-async def try_llm_generate(brief: str, att_names: List[str]) -> Optional[Dict[str, str]]:
-    if not (LLM_URL and LLM_AUTH):
-        return None
-    url = LLM_URL.rstrip("/") + "/chat/completions"
-    body = {
-        "model": "google/gemini-2.0-flash-lite-001",
-        "messages": [
-            {"role": "system", "content": "Return STRICT JSON with a top-level 'files' object."},
-            {"role": "user", "content":
-                f"Build a minimal static app for GitHub Pages. Include index.html and README.md.\nBrief: {brief}\nAttachments: {att_names}\nReturn JSON ONLY."}
-        ],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"}
-    }
-    headers = {"Authorization": LLM_AUTH, "Content-Type": "application/json"}
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(url, headers=headers, json=body)
-            r.raise_for_status()
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-            parsed = json.loads(content)
-            files = parsed.get("files")
-            if isinstance(files, dict) and "index.html" in files:
-                return {k: str(v) for k, v in files.items()}
-    except Exception:
-        return None
-    return None
+def decode_possible_data_uri_or_text(val: str) -> bytes:
+    """
+    The LLM may output base64 data URIs for binary assets. If so, decode; otherwise treat as utf-8 text.
+    """
+    m = DATA_URI_RE.match(val.strip())
+    if m:
+        return base64.b64decode(m.group(2))
+    return val.encode("utf-8")
 
-# ---- Templates (fallback) ----
-def tmpl_sum_of_sales() -> str:
-    return """<!doctype html><html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sales Summary</title>
-<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-</head><body class="container p-4">
-<h1>Sales Summary</h1>
-<p>Total: <strong id="total-sales">0</strong></p>
-<table id="product-sales" class="table table-striped d-none">
-  <thead><tr><th>Product</th><th>Sales</th></tr></thead><tbody></tbody>
-</table>
-<script>
-(async () => {
-  const text = await fetch('data.csv').then(r=>r.text());
-  const rows = text.trim().split(/\\n+/).slice(1).map(l=>l.split(','));
-  let sum=0; const by={};
-  for (const [p,v] of rows) { const n=parseFloat(v); if(!isNaN(n)){ sum+=n; by[p]=(by[p]||0)+n; } }
-  document.querySelector('#total-sales').textContent = sum.toFixed(2);
-  const tbody = document.querySelector('#product-sales tbody');
-  for (const [k,v] of Object.entries(by)) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${k}</td><td>${v.toFixed(2)}</td>`;
-    tbody.appendChild(tr);
-  }
-  if (Object.keys(by).length) document.querySelector('#product-sales').classList.remove('d-none');
-})();
-</script></body></html>"""
-
-def template_from_brief(brief: str, atts: Dict[str, bytes]) -> Dict[str, bytes]:
-    b = brief.lower()
-    files: Dict[str, bytes] = {}
-    if "sum-of-sales" in b or ("sales" in b and "csv" in b):
-        files["index.html"] = tmpl_sum_of_sales().encode()
-        if "data.csv" not in atts:
-            files["data.csv"] = b"product,sales\nA,10\nB,20.5\n"
-        return files
-    # generic fallback
-    files["index.html"] = f"<!doctype html><html><body><h1>Generated App</h1><pre>{brief}</pre></body></html>".encode()
-    return files
-
-# ---- GitHub helpers (automation) ----
-async def ensure_repo(owner: str, repo: str) -> Dict:
+# ===== GitHub automation =====
+async def ensure_repo(owner: str, repo: str) -> Dict[str, Any]:
     r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}")
     if r.status_code == 404:
         r = await gh("POST", f"{GITHUB_API}/user/repos", json_body={
-            "name": repo,
-            "private": False,
-            "auto_init": True,
+            "name": repo, "private": False, "auto_init": True,
             "description": "Auto-generated by LLM code deployer"
         })
         r.raise_for_status()
@@ -190,77 +144,69 @@ async def ensure_repo(owner: str, repo: str) -> Dict:
     return r.json()
 
 async def ensure_actions_write_permissions(owner: str, repo: str):
-    """
-    Give the workflow GITHUB_TOKEN write perms so deploy-pages can publish.
-    API: PUT /repos/{owner}/{repo}/actions/permissions/workflow
-    body: { "default_workflow_permissions": "write", "can_approve_pull_request_reviews": false }
-    """
+    # Give GITHUB_TOKEN write perms so deploy-pages can publish
     url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/permissions/workflow"
     payload = {"default_workflow_permissions": "write", "can_approve_pull_request_reviews": False}
     r = await gh("PUT", url, json_body=payload)
     if r.status_code not in (200, 204):
-        print("⚠️ Failed to set workflow write permissions:", r.status_code, r.text)
+        print("⚠️ Could not set workflow write perms:", r.status_code, r.text)
 
 async def ensure_pages_site(owner: str, repo: str):
-    """
-    Ensure GitHub Pages exists and is set to build from Actions.
-    - GET /repos/{owner}/{repo}/pages
-      - 404 -> POST (create)
-      - 200 -> ensure build_type='workflow' via PUT (update)
-    """
+    # Create/enable Pages set to build from Actions
     get_url = f"{GITHUB_API}/repos/{owner}/{repo}/pages"
     r = await gh("GET", get_url)
     if r.status_code == 404:
-        # Create
-        create_url = get_url  # POST to /pages
-        payload = {"build_type": "workflow"}
-        r2 = await gh("POST", create_url, json_body=payload)
+        # create
+        r2 = await gh("POST", get_url, json_body={"build_type": "workflow"})
         if r2.status_code not in (201, 204):
-            raise HTTPException(status_code=500, detail=f"Failed to create Pages site: {r2.status_code} {r2.text}")
-        return
+            # Some accounts/orgs require explicit PUT (update) or UI; log but continue
+            print("⚠️ Pages create failed:", r2.status_code, r2.text)
     elif r.status_code == 200:
         data = r.json()
         if data.get("build_type") != "workflow":
-            # Update to workflow
-            payload = {"build_type": "workflow"}
-            r2 = await gh("PUT", get_url, json_body=payload)
+            r2 = await gh("PUT", get_url, json_body={"build_type": "workflow"})
             if r2.status_code not in (200, 204):
-                print("⚠️ Could not switch Pages to workflow build_type:", r2.status_code, r2.text)
-        return
+                print("⚠️ Pages update failed:", r2.status_code, r2.text)
     else:
-        raise HTTPException(status_code=500, detail=f"Unexpected Pages GET: {r.status_code} {r.text}")
+        print("⚠️ Pages GET unexpected:", r.status_code, r.text)
 
-async def put_file(owner: str, repo: str, path: str, content_bytes: bytes, message: str):
-    # Read current SHA if exists
-    sha = None
-    r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}")
-    if r.status_code == 200:
-        sha = r.json().get("sha")
-    enc = b64encode_bytes(content_bytes)
-    payload = {"message": message, "content": enc}
-    if sha:
-        payload["sha"] = sha
-    r = await gh("PUT", f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}", json_body=payload)
+async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: str) -> str:
+    # 1) base ref/commit
+    r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/main")
     r.raise_for_status()
-    return r.json()["commit"]["sha"]
+    base_commit = r.json()["object"]["sha"]
 
-async def commit_bundle(owner: str, repo: str, files: Dict[str, bytes], brief: str, task: str, round_i: int, pages_url: str) -> str:
-    # LICENSE
-    commit_sha = await put_file(owner, repo, "LICENSE",
-                                MIT_LICENSE.format(year=time.strftime("%Y"), owner=owner).encode(),
-                                f"[{task}] LICENSE")
-    # README
-    readme = f"# {repo}\n\nTask: `{task}` (round {round_i})\n\nBrief:\n\n{brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
-    commit_sha = await put_file(owner, repo, "README.md", readme.encode(), f"[{task}] README")
-    # Workflow
-    commit_sha = await put_file(owner, repo, ".github/workflows/pages.yml",
-                                PAGES_WORKFLOW.encode(), f"[{task}] pages workflow")
-    # App files
+    r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/git/commits/{base_commit}")
+    r.raise_for_status()
+    base_tree = r.json()["tree"]["sha"]
+
+    # 2) create blobs
+    entries = []
     for path, blob in files.items():
-        commit_sha = await put_file(owner, repo, path, blob, f"[{task}] {path}")
-    return commit_sha
+        rb = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs",
+                      json_body={"content": b64e(blob), "encoding": "base64"})
+        rb.raise_for_status()
+        entries.append({"path": path, "mode": "100644", "type": "blob", "sha": rb.json()["sha"]})
 
-async def wait_for_200(url: str, timeout_s: int = 180):
+    # 3) create new tree
+    rt = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/trees",
+                  json_body={"base_tree": base_tree, "tree": entries})
+    rt.raise_for_status()
+    new_tree = rt.json()["sha"]
+
+    # 4) commit
+    rc = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/commits",
+                  json_body={"message": message, "tree": new_tree, "parents": [base_commit]})
+    rc.raise_for_status()
+    new_commit = rc.json()["sha"]
+
+    # 5) move ref
+    rr = await gh("PATCH", f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/main",
+                  json_body={"sha": new_commit, "force": True})
+    rr.raise_for_status()
+    return new_commit
+
+async def wait_for_200(url: str, timeout_s: int = 180) -> bool:
     start = time.time()
     async with httpx.AsyncClient(timeout=15) as client:
         last = None
@@ -276,7 +222,7 @@ async def wait_for_200(url: str, timeout_s: int = 180):
     print(f"⚠️ Pages not 200 within {timeout_s}s (last={last})")
     return False
 
-async def post_with_backoff(url: str, payload: dict, max_tries: int = 8):
+async def post_with_backoff(url: str, payload: dict, max_tries: int = 8) -> bool:
     delay = 1
     async with httpx.AsyncClient(timeout=30) as client:
         for _ in range(max_tries):
@@ -290,10 +236,158 @@ async def post_with_backoff(url: str, payload: dict, max_tries: int = 8):
             delay *= 2
     return False
 
-# ---- ROUTES ----
+# ===== LLM calls =====
+def _llm_endpoint(path: str) -> str:
+    return LLM_URL.rstrip("/") + path
+
+async def llm_chat_json(messages: List[Dict[str, str]], model: str = "google/gemini-2.0-flash-lite-001") -> Optional[dict]:
+    if not (LLM_URL and LLM_AUTH):
+        return None
+    headers = {"Authorization": LLM_AUTH, "Content-Type": "application/json"}
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    url = _llm_endpoint("/chat/completions")
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(url, headers=headers, json=body)
+            r.raise_for_status()
+            data = r.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+            return json.loads(content)
+    except Exception as e:
+        print("LLM error:", repr(e))
+        return None
+
+# ---- Option B: planner then builder ----
+PLANNER_SYSTEM = "Return STRICT JSON only, as {\"spec\":{...}}. No prose."
+PLANNER_USER_TMPL = """Expand this brief into a build SPEC for a static GitHub Pages app.
+
+Include keys:
+- files: list of file paths to create (must include: index.html, script.js, styles.css, README.md; plus any assets like assets/sample.png or data.csv)
+- dom_ids: ids required by the brief/tests (e.g., ["total-sales","github-created-at","captcha-text"])
+- data_inputs: list of inputs you need (attachments, ?url params, remote APIs). For remote HTTP from browser, use proxy `https://aipipe.org/proxy/<ENCODED_URL>` to avoid CORS.
+- algorithms: stepwise logic to compute outputs from inputs
+- assets_needed: filenames and brief content/format for defaults (e.g., data.csv rows, a sample captcha image, rates.json)
+- fallbacks: what to do if ?url or inputs are missing (must gracefully render)
+- round2_extensions: suggested future changes (tables, filters, aria-live, currency, caching, etc.)
+
+BRIEF:
+{brief}
+
+ATTACHMENTS:
+{attachment_names}
+"""
+
+BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
+BUILDER_USER_TMPL = """Using this SPEC, generate a browser-only static site suitable for GitHub Pages.
+
+Rules:
+1) Create these files at minimum: index.html, script.js, styles.css, README.md. Additional assets under /assets or in root (e.g., data.csv).
+2) index.html
+   - Load Bootstrap 5 via jsDelivr.
+   - Link ./styles.css and ./script.js (relative).
+   - Provide accessible markup; aria-live regions for status when relevant.
+3) script.js
+   - Parse URL params (?url, ?token, etc).
+   - For cross-origin fetches, wrap with the proxy:
+       const proxied = (u) => u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+       await fetch(proxied(url))
+   - If SPEC says an input may be missing, use provided default assets (e.g., ./assets/sample.png or ./data.csv).
+   - Render outputs into the DOM IDs promised in SPEC (e.g., #total-sales).
+   - Be idempotent: re-rendering should not duplicate table rows; totals stay accurate after any updates.
+4) styles.css: basic layout and spacing; no inline styles in HTML.
+5) README.md: include Task, Brief, How to run locally, How it works (inputs, IDs), License.
+6) Keep code minimal but correct.
+
+SPEC:
+{spec_json}
+"""
+
+# ---- Option A: single-shot builder ----
+SINGLE_BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
+SINGLE_BUILDER_USER_TMPL = """Build a browser-only static site for GitHub Pages that satisfies the brief.
+
+Requirements:
+- MUST return: index.html, script.js, styles.css, README.md; plus any needed assets (e.g., assets/sample.png, data.csv).
+- index.html links ./styles.css and ./script.js; loads Bootstrap 5.
+- script.js handles ?url params; uses AIpipe CORS proxy for remote fetches; graceful fallbacks (local assets) if inputs missing.
+- Render outputs using the exact IDs mentioned in the brief.
+- README explains brief, setup, usage, and license.
+
+BRIEF:
+{brief}
+
+ATTACHMENTS:
+{attachment_names}
+"""
+
+# ===== Fallback deterministic templates =====
+def sales_fallback_files() -> Dict[str, bytes]:
+    index_html = """<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sales Summary</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="./styles.css">
+</head><body class="container py-4">
+<h1>Sales Summary</h1>
+<p>Total: <strong id="total-sales">0</strong></p>
+<table id="product-sales" class="table table-striped d-none">
+  <thead><tr><th>Product</th><th>Sales</th></tr></thead><tbody></tbody>
+</table>
+<script src="./script.js"></script>
+</body></html>"""
+    script_js = r"""(async () => {
+  const proxied = (u) => u.startsWith('http') ? `https://aipipe.org/proxy/${encodeURIComponent(u)}` : u;
+  const url = new URLSearchParams(location.search).get('url') || 'data.csv';
+  const text = await fetch(proxied(url)).then(r=>r.text()).catch(()=> '');
+  const rows = text.trim() ? text.trim().split(/\n+/).slice(1).map(l=>l.split(',')) : [];
+  let sum=0; const by={};
+  for (const [p,v] of rows) { const n=parseFloat(v); if(!isNaN(n)){ sum+=n; by[p]=(by[p]||0)+n; } }
+  document.querySelector('#total-sales').textContent = (sum||0).toFixed(2);
+  const tbody = document.querySelector('#product-sales tbody'); tbody.innerHTML='';
+  for (const [k,v] of Object.entries(by)) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${k}</td><td>${v.toFixed(2)}</td>`;
+    tbody.appendChild(tr);
+  }
+  if (Object.keys(by).length) document.querySelector('#product-sales').classList.remove('d-none');
+})();"""
+    styles_css = "body{line-height:1.6}"
+    data_csv = "product,sales\nA,10\nB,20.5\n"
+    return {
+        "index.html": index_html.encode(),
+        "script.js": script_js.encode(),
+        "styles.css": styles_css.encode(),
+        "data.csv": data_csv.encode(),
+    }
+
+def generic_fallback_files(brief: str) -> Dict[str, bytes]:
+    return {
+        "index.html": f"<!doctype html><html><head><meta charset='utf-8'><title>Generated App</title><link rel='stylesheet' href='./styles.css'></head><body class='container'><h1>Generated App</h1><pre id='brief'></pre><script src='./script.js'></script></body></html>".encode(),
+        "script.js": f"document.querySelector('#brief').textContent = {json.dumps(brief)};".encode(),
+        "styles.css": b"body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;padding:2rem;}",
+    }
+
+def choose_template(brief: str) -> Dict[str, bytes]:
+    b = brief.lower()
+    if "sum-of-sales" in b or ("sales" in b and "csv" in b):
+        return sales_fallback_files()
+    # other templates (markdown, captcha) can be added here similarly
+    return generic_fallback_files(brief)
+
+# ===== Validation =====
+def valid_files(files: Dict[str, bytes]) -> bool:
+    req = {"index.html", "script.js", "styles.css", "README.md"}
+    return req.issubset(set(files.keys()))
+
+# ===== ROUTES =====
 @app.get("/")
 def root():
-    return {"status": "ok", "app": "llm-code-deployer"}
+    return {"status": "ok", "mode": "planner->builder with fallbacks"}
 
 @app.post("/api-task")
 async def api_task(body: TaskPayload):
@@ -302,36 +396,80 @@ async def api_task(body: TaskPayload):
     if not GITHUB_TOKEN or not GITHUB_USERNAME:
         raise HTTPException(status_code=500, detail="server missing GitHub config")
 
-    # attachments
+    # --- parse attachments
     att_bytes = parse_attachments(body.attachments)
+    att_names = list(att_bytes.keys())
 
-    # generate files via LLM if configured, else fallback templates
-    files_text = await try_llm_generate(body.brief, list(att_bytes.keys()))
+    # --- try Option B (planner -> builder)
+    files_text: Optional[Dict[str, str]] = None
+    if LLM_URL and LLM_AUTH:
+        # Planner
+        planner_json = await llm_chat_json(
+            [{"role": "system", "content": PLANNER_SYSTEM},
+             {"role": "user", "content": PLANNER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
+        )
+        spec = None
+        if planner_json and isinstance(planner_json.get("spec"), dict):
+            spec = planner_json["spec"]
+            # Basic spec checks
+            has_list = isinstance(spec.get("files"), list) and any(isinstance(x, str) for x in spec["files"])
+            if not has_list:
+                spec = None
+
+        # Builder (only if spec OK)
+        if spec is not None:
+            builder_json = await llm_chat_json(
+                [{"role": "system", "content": BUILDER_SYSTEM},
+                 {"role": "user", "content": BUILDER_USER_TMPL.format(spec_json=json.dumps(spec))}]
+            )
+            if builder_json and isinstance(builder_json.get("files"), dict):
+                files_text = {k: str(v) for k, v in builder_json["files"].items()}
+
+        # --- if Option B failed, try Option A
+        if files_text is None:
+            single_json = await llm_chat_json(
+                [{"role": "system", "content": SINGLE_BUILDER_SYSTEM},
+                 {"role": "user", "content": SINGLE_BUILDER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
+            )
+            if single_json and isinstance(single_json.get("files"), dict):
+                files_text = {k: str(v) for k, v in single_json["files"].items()}
+
+    # --- convert files_text -> bytes
+    files: Dict[str, bytes] = {}
     if files_text:
-        files: Dict[str, bytes] = {p: (v.encode() if isinstance(v, str) else v) for p, v in files_text.items()}
-    else:
-        files = template_from_brief(body.brief, att_bytes)
+        for path, val in files_text.items():
+            files[path] = decode_possible_data_uri_or_text(val)
 
-    # merge attachments (don’t overwrite generated ones)
+    # --- fallback deterministic templates if needed OR if required files missing
+    if not files or not valid_files(files):
+        files = choose_template(body.brief)
+
+    # --- merge/OVERWRITE attachments so tests read the correct content
     for name, blob in att_bytes.items():
-        files.setdefault(name, blob)
+        files[name] = blob
 
+    # --- repo setup
     repo_name = body.task.replace("/", "-")
     pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
-
-    # ensure repo exists
     await ensure_repo(GITHUB_USERNAME, repo_name)
-
-    # **programmatically allow workflow token to write**
     await ensure_actions_write_permissions(GITHUB_USERNAME, repo_name)
-
-    # **programmatically create/enable Pages (build from Actions)**
     await ensure_pages_site(GITHUB_USERNAME, repo_name)
 
-    # commit everything (workflow + files)
-    commit_sha = await commit_bundle(GITHUB_USERNAME, repo_name, files, body.brief, body.task, body.round, pages_url)
+    # --- add license/readme/workflow to ONE batched commit
+    all_files: Dict[str, bytes] = {}
+    all_files["LICENSE"] = MIT_LICENSE.format(year=time.strftime("%Y"), owner=GITHUB_USERNAME).encode()
+    readme = f"# {repo_name}\n\nTask: `{body.task}` (round {body.round})\n\nBrief:\n\n{body.brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
+    all_files["README.md"] = (files.get("README.md") or readme.encode())
+    all_files[".github/workflows/pages.yml"] = PAGES_WORKFLOW.encode()
+    # app files
+    for p, b in files.items():
+        if p == "README.md":  # already handled
+            continue
+        all_files[p] = b
 
-    # wait briefly for Pages (best-effort)
+    commit_sha = await batch_commit(GITHUB_USERNAME, repo_name, all_files, f"[{body.task}] round {body.round} deploy")
+
+    # --- best-effort wait for Pages
     await wait_for_200(pages_url, timeout_s=180)
 
     resp = {
@@ -343,7 +481,5 @@ async def api_task(body: TaskPayload):
         "commit_sha": commit_sha,
         "pages_url": pages_url,
     }
-
-    # ping evaluator
     await post_with_backoff(body.evaluation_url, resp)
     return resp
