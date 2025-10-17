@@ -54,7 +54,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-# Minimal single-job Pages workflow
 PAGES_WORKFLOW = """name: GitHub Pages
 
 on:
@@ -98,10 +97,9 @@ jobs:
         uses: actions/deploy-pages@v4
 """
 
-# Safe regex for data URIs (dash escaped)
 DATA_URI_RE = re.compile(r"^data:([\w/.\+\-]+);base64,(.*)$", re.IGNORECASE)
 
-# ===== HTTP helper =====
+# ===== HTTP/GitHub helpers =====
 async def gh(method: str, url: str, json_body=None, content=None, extra_headers=None) -> httpx.Response:
     headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     if extra_headers:
@@ -127,7 +125,6 @@ def decode_possible_data_uri_or_text(val: str) -> bytes:
         return base64.b64decode(m.group(2))
     return val.encode("utf-8")
 
-# ===== GitHub automation =====
 async def ensure_repo(owner: str, repo: str) -> Dict[str, Any]:
     r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}")
     if r.status_code == 404:
@@ -164,14 +161,15 @@ async def ensure_pages_site(owner: str, repo: str):
         print("⚠️ Pages GET unexpected:", r.status_code, r.text)
 
 async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: str) -> str:
+    # base ref
     r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/git/ref/heads/main")
     r.raise_for_status()
     base_commit = r.json()["object"]["sha"]
-
     r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/git/commits/{base_commit}")
     r.raise_for_status()
     base_tree = r.json()["tree"]["sha"]
 
+    # blobs
     entries = []
     for path, blob in files.items():
         rb = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/blobs",
@@ -179,20 +177,46 @@ async def batch_commit(owner: str, repo: str, files: Dict[str, bytes], message: 
         rb.raise_for_status()
         entries.append({"path": path, "mode": "100644", "type": "blob", "sha": rb.json()["sha"]})
 
+    # tree
     rt = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/trees",
                   json_body={"base_tree": base_tree, "tree": entries})
     rt.raise_for_status()
     new_tree = rt.json()["sha"]
 
+    # commit
     rc = await gh("POST", f"{GITHUB_API}/repos/{owner}/{repo}/git/commits",
                   json_body={"message": message, "tree": new_tree, "parents": [base_commit]})
     rc.raise_for_status()
     new_commit = rc.json()["sha"]
 
+    # update ref
     rr = await gh("PATCH", f"{GITHUB_API}/repos/{owner}/{repo}/git/refs/heads/main",
                   json_body={"sha": new_commit, "force": True})
     rr.raise_for_status()
     return new_commit
+
+async def fetch_repo_files(owner: str, repo: str, paths: List[str]) -> Dict[str, bytes]:
+    """
+    Fetch a set of files (if they exist) from the repo@main.
+    """
+    out: Dict[str, bytes] = {}
+    for p in paths:
+        r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/contents/{p}?ref=main")
+        if r.status_code == 200:
+            j = r.json()
+            if isinstance(j, dict) and j.get("encoding") == "base64" and "content" in j:
+                out[p] = base64.b64decode(j["content"])
+    return out
+
+async def list_assets(owner: str, repo: str) -> List[str]:
+    # best-effort: list assets/ dir
+    r = await gh("GET", f"{GITHUB_API}/repos/{owner}/{repo}/contents/assets?ref=main")
+    paths: List[str] = []
+    if r.status_code == 200 and isinstance(r.json(), list):
+        for item in r.json():
+            if item.get("type") == "file" and item.get("path", "").startswith("assets/"):
+                paths.append(item["path"])
+    return paths
 
 async def wait_for_200(url: str, timeout_s: int = 180) -> bool:
     start = time.time()
@@ -224,7 +248,7 @@ async def post_with_backoff(url: str, payload: dict, max_tries: int = 8) -> bool
             delay *= 2
     return False
 
-# ===== LLM calls =====
+# ===== LLM helpers =====
 def _llm_endpoint(path: str) -> str:
     return LLM_URL.rstrip("/") + path
 
@@ -232,15 +256,10 @@ async def llm_chat_json(messages: List[Dict[str, str]], model: str = "google/gem
     if not (LLM_URL and LLM_AUTH):
         return None
     headers = {"Authorization": LLM_AUTH, "Content-Type": "application/json"}
-    body = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
+    body = {"model": model, "messages": messages, "temperature": 0.2, "response_format": {"type": "json_object"}}
     url = _llm_endpoint("/chat/completions")
     try:
-        async with httpx.AsyncClient(timeout=90) as client:
+        async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(url, headers=headers, json=body)
             r.raise_for_status()
             data = r.json()
@@ -250,18 +269,18 @@ async def llm_chat_json(messages: List[Dict[str, str]], model: str = "google/gem
         print("LLM error:", repr(e))
         return None
 
-# ---- Option B: planner then builder ----
+# ===== Prompts =====
 PLANNER_SYSTEM = "Return STRICT JSON only, as {\"spec\":{...}}. No prose."
 PLANNER_USER_TMPL = """Expand this brief into a build SPEC for a static GitHub Pages app.
 
 Include keys:
 - files: list of file paths to create (must include: index.html, script.js, styles.css, README.md; plus any assets like assets/sample.png or data.csv)
-- dom_ids: ids required by the brief/tests (e.g., ["total-sales","github-created-at","captcha-text","stats-products","stats-total","sales-pie","theme-toggle"])
-- data_inputs: list of inputs you need (attachments, ?url params, remote APIs). For remote HTTP from browser, use proxy `https://aipipe.org/proxy/<ENCODED_URL>` to avoid CORS.
-- algorithms: stepwise logic to compute outputs from inputs
-- assets_needed: filenames and brief content/format for defaults (e.g., data.csv rows, a sample captcha image, rates.json)
-- fallbacks: what to do if ?url or inputs are missing (must gracefully render)
-- round2_extensions: suggested future changes (tables, filters, aria-live, currency, caching, etc.)
+- dom_ids: ids required by the brief/tests
+- data_inputs: inputs (attachments, ?url params, remote APIs). For cross-origin fetches, use proxy: https://aipipe.org/proxy/<ENCODED_URL>
+- algorithms: stepwise logic
+- assets_needed: filenames + sample content for defaults
+- fallbacks: must render even if ?url or inputs missing
+- round2_extensions: likely additions (tables, filters, aria-live, charts, currency, caching)
 
 BRIEF:
 {brief}
@@ -271,40 +290,30 @@ ATTACHMENTS:
 """
 
 BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
-BUILDER_USER_TMPL = """Using this SPEC, generate a browser-only static site suitable for GitHub Pages.
+BUILDER_USER_TMPL = """Using this SPEC, generate a browser-only static site for GitHub Pages.
 
 Rules:
-1) Create these files at minimum: index.html, script.js, styles.css, README.md. Additional assets under /assets or in root (e.g., data.csv).
-2) index.html
-   - Load Bootstrap 5 via jsDelivr.
-   - Link ./styles.css and ./script.js (relative).
-   - Provide accessible markup; aria-live regions for status when relevant.
-3) script.js
-   - Parse URL params (?url, ?token, etc).
-   - For cross-origin fetches, wrap with the proxy:
-       const proxied = (u) => u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
-       await fetch(proxied(url))
-   - If SPEC says an input may be missing, use provided default assets (e.g., ./assets/sample.png or ./data.csv).
-   - Render outputs into the DOM IDs promised in SPEC (e.g., #total-sales).
-   - Be idempotent: re-rendering should not duplicate table rows; totals stay accurate after any updates.
-4) styles.css: basic layout and spacing; demonstrate clamp() and calc().
-5) README.md: include Task, Brief, How to run locally, How it works (inputs, IDs), License.
-6) Keep code minimal but correct.
+- Create at minimum: index.html, script.js, styles.css, README.md. Additional assets under /assets or root (e.g., data.csv).
+- index.html loads Bootstrap 5 (jsDelivr), links ./styles.css & ./script.js (relative), uses accessible markup.
+- script.js: parse URL params; wrap cross-origin fetches with proxy function:
+    const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+  Use default local assets when inputs missing. Render to the exact IDs required by the SPEC. Avoid duplicate rows on re-render.
+- styles.css: basic layout; can use clamp() and calc().
+- README.md: Task, Brief, Usage, How it works (inputs & IDs), License.
+- Output full files (not diffs). No prose.
 
 SPEC:
 {spec_json}
 """
 
-# ---- Option A: single-shot builder ----
 SINGLE_BUILDER_SYSTEM = "Return STRICT JSON only, as {\"files\":{...}}. No prose."
 SINGLE_BUILDER_USER_TMPL = """Build a browser-only static site for GitHub Pages that satisfies the brief.
 
 Requirements:
-- MUST return: index.html, script.js, styles.css, README.md; plus any needed assets (e.g., assets/sample.png, data.csv).
+- MUST return: index.html, script.js, styles.css, README.md; plus any needed assets.
 - index.html links ./styles.css and ./script.js; loads Bootstrap 5.
-- script.js handles ?url params; uses AIpipe CORS proxy for remote fetches; graceful fallbacks (local assets) if inputs missing.
-- Render outputs using the exact IDs mentioned in the brief.
-- README explains brief, setup, usage, and license.
+- script.js handles ?url params; uses AIpipe CORS proxy for remote fetches; graceful fallbacks; render to exact IDs; no duplication.
+- Output full files (not diffs). No prose.
 
 BRIEF:
 {brief}
@@ -313,7 +322,34 @@ ATTACHMENTS:
 {attachment_names}
 """
 
-# ===== Deterministic templates =====
+PATCHER_SYSTEM = (
+    "You are a precise code transformer. Return STRICT JSON only as {\"files\":{...}}. "
+    "No prose. No explanations. No diffs. Output full updated files."
+)
+PATCHER_USER_TMPL = """You are given the current project files and a new BRIEF. Update the project with the **minimal** safe edits to satisfy the BRIEF while preserving working behavior.
+
+Hard requirements:
+- Do NOT echo the brief into the UI.
+- Keep existing IDs/selectors and behaviors unless the BRIEF explicitly changes them.
+- Maintain accessibility and current structure; do not break existing features.
+- Only change what is necessary to complete the task.
+- Avoid bugs/regressions; keep #ids like #total-sales accurate.
+- Return **full files** (not diffs), JSON only. Include at least: index.html, script.js, styles.css, README.md. You may add assets if needed.
+
+If fetching remote content from the browser, use this proxy helper:
+  const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${{encodeURIComponent(u)}}` : u;
+
+BRIEF:
+{brief}
+
+ATTACHMENTS:
+{attachment_names}
+
+CURRENT_FILES (path => full text):
+{current_files_json}
+"""
+
+# ===== Deterministic templates (safety net) =====
 def sales_round1_files() -> Dict[str, bytes]:
     index_html = """<!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -329,7 +365,7 @@ def sales_round1_files() -> Dict[str, bytes]:
 <script src="./script.js"></script>
 </body></html>"""
     script_js = r"""(async () => {
-  const proxied = (u) => u.startsWith('http') ? `https://aipipe.org/proxy/${encodeURIComponent(u)}` : u;
+  const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${encodeURIComponent(u)}` : u;
   const url = new URLSearchParams(location.search).get('url') || 'data.csv';
   const text = await fetch(proxied(url)).then(r=>r.text()).catch(()=> '');
   const rows = text.trim() ? text.trim().split(/\n+/).slice(1).map(l=>l.split(',')) : [];
@@ -346,12 +382,7 @@ def sales_round1_files() -> Dict[str, bytes]:
 })();"""
     styles_css = "h1{font-size:clamp(1.5rem,2.5vw,2.25rem)} body{line-height:1.6}"
     data_csv = "product,sales\nA,10\nB,20.5\n"
-    return {
-        "index.html": index_html.encode(),
-        "script.js": script_js.encode(),
-        "styles.css": styles_css.encode(),
-        "data.csv": data_csv.encode(),
-    }
+    return {"index.html": index_html.encode(), "script.js": script_js.encode(), "styles.css": styles_css.encode(), "data.csv": data_csv.encode()}
 
 def sales_round2_files() -> Dict[str, bytes]:
     index_html = """<!doctype html><html><head>
@@ -387,93 +418,48 @@ def sales_round2_files() -> Dict[str, bytes]:
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
   <script src="./script.js"></script>
 </body></html>"""
     script_js = r"""(() => {
   const $ = (sel) => document.querySelector(sel);
   const proxied = (u) => u && u.startsWith('http') ? `https://aipipe.org/proxy/${encodeURIComponent(u)}` : u;
-
   let chart;
-
-  async function loadData() {
+  async function loadData(){
     const url = new URLSearchParams(location.search).get('url') || 'data.csv';
     const text = await fetch(proxied(url)).then(r=>r.text()).catch(()=> '');
     const rows = text.trim() ? text.trim().split(/\n+/).slice(1).map(l=>l.split(',')) : [];
-    const by = {}, products = new Set();
-    let total = 0;
-    for (const [p, v] of rows) {
-      const n = parseFloat(v);
-      if (!isNaN(n)) { total += n; by[p] = (by[p]||0)+n; products.add(p); }
-    }
-    // Stats
+    const by = {}, set = new Set(); let total=0;
+    for (const [p,v] of rows){ const n=parseFloat(v); if(!isNaN(n)){ total+=n; by[p]=(by[p]||0)+n; set.add(p); } }
     $('#total-sales').textContent = total.toFixed(2);
     $('#stats-total').textContent = total.toFixed(2);
-    $('#stats-products').textContent = String(products.size);
-
-    // Table
-    const tbody = $('#product-sales tbody');
-    tbody.innerHTML = '';
-    for (const [k, v] of Object.entries(by)) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td>${k}</td><td>${v.toFixed(2)}</td>`;
-      tbody.appendChild(tr);
-    }
-
-    // Chart
-    const labels = Object.keys(by);
-    const data = Object.values(by);
+    $('#stats-products').textContent = String(set.size);
+    const tbody = $('#product-sales tbody'); tbody.innerHTML='';
+    for (const [k,v] of Object.entries(by)){ const tr=document.createElement('tr'); tr.innerHTML = `<td>${k}</td><td>${v.toFixed(2)}</td>`; tbody.appendChild(tr); }
+    const labels = Object.keys(by), data = Object.values(by);
     const ctx = document.getElementById('sales-pie').getContext('2d');
-    const isDark = document.documentElement.dataset.theme === 'dark';
-    const border = isDark ? '#ddd' : '#333';
-
     if (chart) chart.destroy();
-    chart = new Chart(ctx, {
-      type: 'pie',
-      data: { labels, datasets: [{ data }] },
-      options: {
-        plugins: { legend: { labels: { color: border } } }
-      }
-    });
+    chart = new Chart(ctx, { type:'pie', data:{ labels, datasets:[{ data }] } });
   }
-
-  function toggleTheme() {
+  document.getElementById('theme-toggle').addEventListener('click', ()=>{
     const root = document.documentElement;
-    const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
-    root.dataset.theme = next;
-    // Re-draw chart to match colors
+    root.dataset.theme = (root.dataset.theme === 'dark') ? 'light':'dark';
     loadData();
-  }
-
-  $('#theme-toggle').addEventListener('click', toggleTheme);
-  // initial
+  });
   loadData();
 })();"""
-    styles_css = r""":root{
-  --bg: #ffffff;
-  --fg: #111111;
-  --muted: #6c757d;
-  --space: clamp(0.5rem, 1.5vw, 1rem);
-}
-:root[data-theme="dark"]{
-  --bg: #0f1115;
-  --fg: #e7e7e7;
-  --muted: #9aa0a6;
-}
-html,body{background:var(--bg);color:var(--fg);}
-h1{font-size:clamp(1.6rem, 3vw, 2.4rem); margin-bottom: calc(var(--space) * 1.5);}
-.table{margin-bottom: calc(var(--space) * 2);}
-.btn{margin-left: var(--space);}
+    styles_css = r""":root{--bg:#fff;--fg:#111;--muted:#6c757d;--space:clamp(.5rem,1.5vw,1rem)}
+:root[data-theme="dark"]{--bg:#0f1115;--fg:#e7e7e7;--muted:#9aa0a6}
+html,body{background:var(--bg);color:var(--fg)}
+h1{font-size:clamp(1.6rem,3vw,2.4rem);margin-bottom:calc(var(--space)*1.5)}
+.table{margin-bottom:calc(var(--space)*2)}
+.btn{margin-left:var(--space)}
 """
-    return {
-        "index.html": index_html.encode(),
-        "script.js": script_js.encode(),
-        "styles.css": styles_css.encode(),
-    }
+    return {"index.html": index_html.encode(), "script.js": script_js.encode(), "styles.css": styles_css.encode()}
 
 def generic_files(brief: str) -> Dict[str, bytes]:
     return {
-        "index.html": f"<!doctype html><html><head><meta charset='utf-8'><title>Generated App</title><link rel='stylesheet' href='./styles.css'></head><body class='container py-4'><h1>Generated App</h1><pre id='brief'></pre><script src='./script.js'></script></body></html>".encode(),
+        "index.html": f"<!doctype html><html><head><meta charset='utf-8'><title>Generated App</title><link rel='stylesheet' href='./styles.css'></head><body class='container py-4'><h1>Generated App</h1><pre id='brief' style='white-space:pre-wrap'></pre><script src='./script.js'></script></body></html>".encode(),
         "script.js": f"document.querySelector('#brief').textContent = {json.dumps(brief)};".encode(),
         "styles.css": b"body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}",
     }
@@ -484,16 +470,14 @@ def choose_template(brief: str, round_i: int) -> Dict[str, bytes]:
         return sales_round2_files() if round_i >= 2 else sales_round1_files()
     return generic_files(brief)
 
-# ===== Validation =====
-def valid_files(files: Dict[str, bytes]) -> bool:
-    req = {"index.html", "script.js", "styles.css"}
-    # README.md will be added if missing
-    return req.issubset(set(files.keys()))
+# ===== Validators =====
+def ensure_core(files: Dict[str, bytes]) -> bool:
+    return {"index.html","script.js","styles.css"}.issubset(files.keys())
 
 # ===== ROUTES =====
 @app.get("/")
 def root():
-    return {"status": "ok", "mode": "planner->builder with Round-2 deterministic fallback"}
+    return {"status": "ok", "mode": "round-aware (planner/builder; context patcher on round>=2)"}
 
 @app.post("/api-task")
 async def api_task(body: TaskPayload):
@@ -506,28 +490,53 @@ async def api_task(body: TaskPayload):
     att_bytes = parse_attachments(body.attachments)
     att_names = list(att_bytes.keys())
 
-    # try planner->builder, then single-shot
+    repo_name = body.task.replace("/", "-")
+    pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
+    await ensure_repo(GITHUB_USERNAME, repo_name)
+    await ensure_actions_write_permissions(GITHUB_USERNAME, repo_name)
+    await ensure_pages_site(GITHUB_USERNAME, repo_name)
+
     files_text: Optional[Dict[str, str]] = None
-    if LLM_URL and LLM_AUTH:
-        # planner
-        planner = await llm_chat_json(
-            [{"role": "system", "content": PLANNER_SYSTEM},
-             {"role": "user", "content": PLANNER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
+
+    # ===== Round >= 2: context-aware patcher =====
+    if body.round >= 2 and LLM_URL and LLM_AUTH:
+        # fetch current core files + assets + data.*
+        core_paths = ["index.html","script.js","styles.css","README.md","data.csv","data.json"]
+        asset_paths = await list_assets(GITHUB_USERNAME, repo_name)
+        current = await fetch_repo_files(GITHUB_USERNAME, repo_name, core_paths + asset_paths)
+        # stringify for LLM
+        current_text_map = {p: current[p].decode("utf-8", errors="replace") for p in current}
+        patcher_json = await llm_chat_json(
+            [
+                {"role":"system","content":PATCHER_SYSTEM},
+                {"role":"user","content":PATCHER_USER_TMPL.format(
+                    brief=body.brief,
+                    attachment_names=att_names,
+                    current_files_json=json.dumps(current_text_map)[:200000]  # cap safety
+                )}
+            ]
         )
-        spec = planner.get("spec") if isinstance(planner, dict) else None
-        # builder
+        if isinstance(patcher_json, dict) and isinstance(patcher_json.get("files"), dict):
+            files_text = {k: str(v) for k, v in patcher_json["files"].items()}
+
+    # ===== Round 1 or fallback: planner -> builder, then single-shot =====
+    if files_text is None and LLM_URL and LLM_AUTH:
+        planner_json = await llm_chat_json(
+            [{"role":"system","content":PLANNER_SYSTEM},
+             {"role":"user","content":PLANNER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
+        )
+        spec = planner_json.get("spec") if isinstance(planner_json, dict) else None
         if isinstance(spec, dict):
             built = await llm_chat_json(
-                [{"role": "system", "content": BUILDER_SYSTEM},
-                 {"role": "user", "content": BUILDER_USER_TMPL.format(spec_json=json.dumps(spec))}]
+                [{"role":"system","content":BUILDER_SYSTEM},
+                 {"role":"user","content":BUILDER_USER_TMPL.format(spec_json=json.dumps(spec))}]
             )
             if isinstance(built, dict) and isinstance(built.get("files"), dict):
                 files_text = {k: str(v) for k, v in built["files"].items()}
-        # single-shot
         if files_text is None:
             single = await llm_chat_json(
-                [{"role": "system", "content": SINGLE_BUILDER_SYSTEM},
-                 {"role": "user", "content": SINGLE_BUILDER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
+                [{"role":"system","content":SINGLE_BUILDER_SYSTEM},
+                 {"role":"user","content":SINGLE_BUILDER_USER_TMPL.format(brief=body.brief, attachment_names=att_names)}]
             )
             if isinstance(single, dict) and isinstance(single.get("files"), dict):
                 files_text = {k: str(v) for k, v in single["files"].items()}
@@ -538,26 +547,19 @@ async def api_task(body: TaskPayload):
         for path, val in files_text.items():
             files[path] = decode_possible_data_uri_or_text(val)
 
-    # fallback (now round-aware)
-    if not files or not valid_files(files):
+    # deterministic fallback
+    if not ensure_core(files):
         files = choose_template(body.brief, body.round)
 
-    # force-overwrite attachments
+    # overwrite attachments
     for name, blob in att_bytes.items():
         files[name] = blob
 
-    repo_name = body.task.replace("/", "-")
-    pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
-    await ensure_repo(GITHUB_USERNAME, repo_name)
-    await ensure_actions_write_permissions(GITHUB_USERNAME, repo_name)
-    await ensure_pages_site(GITHUB_USERNAME, repo_name)
-
-    # add license/readme/workflow in one commit
+    # add license, workflow, readme (keep LLM README if provided)
     all_files: Dict[str, bytes] = {}
     all_files["LICENSE"] = MIT_LICENSE.format(year=time.strftime("%Y"), owner=GITHUB_USERNAME).encode()
-    # keep README from LLM if present, else synthesize
-    readme_auto = f"# {repo_name}\n\nTask: `{body.task}` (round {body.round})\n\nBrief:\n\n{body.brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
-    all_files["README.md"] = files.get("README.md", readme_auto.encode())
+    default_readme = f"# {repo_name}\n\nTask: `{body.task}` (round {body.round})\n\nBrief:\n\n{body.brief}\n\nPages: {pages_url}\n\nLicense: MIT\n"
+    all_files["README.md"] = files.get("README.md", default_readme.encode())
     all_files[".github/workflows/pages.yml"] = PAGES_WORKFLOW.encode()
     for p, b in files.items():
         if p == "README.md":
@@ -565,7 +567,6 @@ async def api_task(body: TaskPayload):
         all_files[p] = b
 
     commit_sha = await batch_commit(GITHUB_USERNAME, repo_name, all_files, f"[{body.task}] round {body.round} deploy")
-
     await wait_for_200(pages_url, timeout_s=180)
 
     resp = {
